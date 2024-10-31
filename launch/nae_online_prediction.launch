@@ -1,0 +1,3 @@
+<launch>
+    <node pkg="nae_online_prediction" type="online_prediction_node.py" name="nae_online_prediction_node" output="screen" />
+</launch>
