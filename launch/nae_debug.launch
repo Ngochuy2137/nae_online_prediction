@@ -1,0 +1,4 @@
+<launch>
+    <node pkg="nae_online_prediction" type="nae_debugger_node.py" name="nae_debugger_node" output="screen" />
+    <node pkg="rviz" type="rviz" name="rviz" args="-d $(find nae_online_prediction)/rviz/rviz.rviz" />
+</launch>
