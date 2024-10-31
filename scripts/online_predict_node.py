@@ -160,11 +160,15 @@ class NAEOnlinePredictor:
             print(name + 'Reset historical data')
             print('\n\n')
             self.printer.print_green(name + '===============================', background=True)
-            self.printer.print_green(name + 'Press enter to start predicting')
+            self.printer.print_green(name + 'Press ENTER 2 times to start predicting')
             self.printer.print_green(name + '===============================\n', background=True)
             input()
+
             last_lenth = 0
             self.pred_seq = None
+            self.publish_prediction(pred_seq=None)
+            input()
+
             self.pressed_enter_event.set()
             # check pressed enter event status
             print('check pressed enter event status: ', self.pressed_enter_event.is_set())
@@ -224,9 +228,9 @@ class NAEOnlinePredictor:
                     input_data = np.expand_dims(input_data, axis=0)
                     # predict
                     self.pred_seq = self.nae.predict(input_data, evaluation=True).cpu().numpy()[0]
-                    impact_point = self.pred_seq[-1]
+                    final_pred_point = self.pred_seq[-1]
                     # check impact point is in active range z
-                    if impact_point[2] < self.active_range_z[0]:
+                    if final_pred_point[2] < self.active_range_z[0]:
                         # publish prediction
                         self.publish_prediction(self.pred_seq, impact_point=True, pred_traj=False)
                         # print in green color
@@ -238,15 +242,35 @@ class NAEOnlinePredictor:
                             self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
                         break
 
-    def publish_prediction(self, pred_seq, impact_point=True, pred_traj=True):
+    def publish_prediction(self, pred_seq=None, impact_point=True, pred_traj=True):
+        if pred_seq is None:
+            impact_point = PoseStamped()
+            impact_point.header.stamp = rospy.Time.now()
+            impact_point.header.frame_id = 'world'
+            impact_point.pose.position.x = self.active_range_x[0]
+            impact_point.pose.position.y = self.active_range_y[0]
+            impact_point.pose.position.z = 0
+            impact_point.pose.orientation.w = 1
+            self.impact_point_pub.publish(impact_point)
+            self.printer.print_green('[PUBLISH-PREDICTION] Reset prediction to ' + str(impact_point.pose.position.x) + ' ' + str(impact_point.pose.position.y) + ' ' + str(impact_point.pose.position.z))
+            return 
         if impact_point:
             impact_point = PoseStamped()
             impact_point.header.stamp = rospy.Time.now()
             impact_point.header.frame_id = 'world'
-            impact_point.pose.position.x = pred_seq[-1][0]
-            impact_point.pose.position.y = pred_seq[-1][1]
-            impact_point.pose.position.z = pred_seq[-1][2]
+
+            # filter out impact point whose z close to self.active_range_z[0]
+            pred_seq_filtered = [pred_seq[i] for i in range(0, len(pred_seq)) if pred_seq[i][2] >= self.active_range_z[0]]
+            impact_point.pose.position.x = pred_seq_filtered[-1][0]
+            impact_point.pose.position.y = pred_seq_filtered[-1][1]
+            impact_point.pose.position.z = pred_seq_filtered[-1][2]
             impact_point.pose.orientation.w = 1
+
+            print('\nPredicted impact point:')
+
+            for p in pred_seq_filtered[-10:]:
+                print('     point: ', round(p[0], 5), ' ', round(p[1], 5), ' ', round(p[2], 5))
+
             self.impact_point_pub.publish(impact_point)
         if pred_traj:
             pred_traj = PointArray()
@@ -295,7 +319,7 @@ def main():
     # active_range_z = rospy.get_param('~active_range_z', [0.2, 10000])
     active_range_x = rospy.get_param('~active_range_x', [-0.5, 10000])
     active_range_y = rospy.get_param('~active_range_y', [-1.5, 100000])
-    active_range_z = rospy.get_param('~active_range_z', [0.07, 10000])
+    active_range_z = rospy.get_param('~active_range_z', [0.2, 10000])
     nae_online_predictor = NAEOnlinePredictor(model_path, model_params, training_params, prediction_params, mocap_topic, active_range_x, active_range_y, active_range_z, swap_y_z)
     rospy.spin()
 
