@@ -12,6 +12,8 @@ from nae.nae import *
 from nae.utils.submodules.printer import Printer
 import threading
 
+DEBUG_LOG = False
+
 class HistoricalData:
     def __init__(self, storage_max_len=300):
         self.data_points = []
@@ -43,8 +45,8 @@ class HistoricalData:
             except ZeroDivisionError:
                 rospy.logwarn('[HISTORICAL-DATA] Zero division error')
                 return
-            # clear oldest data points if the length of data_points exceeds storage_max_len
-            self.clear_oldest_data_points()
+            # # TODO: clear oldest data points if the length of data_points exceeds storage_max_len
+            # self.clear_oldest_data_points()
 
         # append new data point
         new_data_point = np.concatenate([new_pos, new_vel, self.acc])
@@ -86,7 +88,7 @@ class NAEOnlinePredictor:
         self.mocap_sub = rospy.Subscriber(mocap_topic, PoseStamped, self.mocap_callback)
         # Publish predicted trajectory
         self.predicted_traj_pub = rospy.Publisher('NAE/predicted_traj', PointArray, queue_size=1)
-        self.impact_point_pub = rospy.Publisher('NAE/impact_point', Point, queue_size=1)
+        self.impact_point_pub = rospy.Publisher('NAE/impact_point', PoseStamped, queue_size=1)
 
         # Variables
         self.pred_seq = None
@@ -121,20 +123,23 @@ class NAEOnlinePredictor:
             curr_pos = [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z]
         
         if not self.pressed_enter_event.is_set():
-            # rospy.logwarn(name + 'Disable getting mocap data')
+            # rospy.logwarn(name + 'Press ENTER to enable getting mocap data')
             # skip this callback loop if the enter key is not pressed
             return
         
         # check current position is in active range
         if curr_pos[0] < self.active_range_x[0] or curr_pos[0] > self.active_range_x[1] or \
             curr_pos[1] < self.active_range_y[0] or curr_pos[1] > self.active_range_y[1]:
-            rospy.logwarn(name + 'Current position is out of active range')
+
+            self.printer.print_purple(name + 'Current position is out of active range')
+            self.printer.print_purple('     cur_pos: ' + str(curr_pos) + ' active_range_x: ' + str(self.active_range_x) + ' active_range_y: ' + str(self.active_range_y))
             return
     
         # TODO: Using queue to store data, prevent data loss
-        if not self.historical_data_lock.acquire(blocking=False):
+        if not self.historical_data_lock.acquire(blocking=True):
             # TODO: print in red color
             rospy.logwarn(name + 'Cannot get lock, data loss')
+            input()
             return
         try:
             self.historical_data.append(curr_pos, msg.header.stamp.to_sec())
@@ -142,6 +147,7 @@ class NAEOnlinePredictor:
             self.historical_data_lock.release()
         
     def online_predict(self):
+        # LOOP: Maintain the thread
         while not rospy.is_shutdown():
             name = '[ONLINE-PREDICT] '
 
@@ -160,29 +166,52 @@ class NAEOnlinePredictor:
             last_lenth = 0
             self.pred_seq = None
             self.pressed_enter_event.set()
+            # check pressed enter event status
+            print('check pressed enter event status: ', self.pressed_enter_event.is_set())
+
+            # LOOP: Prediction for one throw
             while not rospy.is_shutdown():
                 # get data
                 self.historical_data_lock.acquire(blocking=True)
                 curr_historical_data = self.historical_data.get_data()
-                self.historical_data_lock.release()               
-                # print('     ', name + 'Current historical data len: ', len(curr_historical_data))
+                self.historical_data_lock.release()     
 
                 if len(curr_historical_data) < self.input_len_req:
-                    print('     ', name + 'loading more data ...')
+                    # print('     ', name + 'loading more data ... current length: ', len(curr_historical_data))
                     continue
+             
+                curr_pos = curr_historical_data[-1][:3]
+
+                # check out of active range x, y, z
+                if curr_pos[0] < self.active_range_x[0] or curr_pos[0] > self.active_range_x[1] or \
+                    curr_pos[1] < self.active_range_y[0] or curr_pos[1] > self.active_range_y[1]:
+                    rospy.logwarn(name + 'Current position is out of active range')
+                    continue
+
                 if len(curr_historical_data) == last_lenth:
-                    print('     ', name + 'No new data, skip this loop')
+                    # print('     ', name + 'No new data, skip this loop, current length: ', last_lenth)
                     continue
+
+                # print('             get new data: ', len(curr_historical_data))
                 last_lenth = len(curr_historical_data)
 
-                curr_pos = curr_historical_data[-1][:3]
                 if curr_pos[2] < self.active_range_z[0]:
                     rospy.logwarn(name + 'Object height is under ' + str(self.active_range_z[0]) + ' m. Finish prediction !')
+                    # cleat enter event
+                    self.pressed_enter_event.clear()
                     break
 
                 # --- Predict ---
-                pred_impacted = False
-                while not pred_impacted:
+                count = 0
+                predict_time = time.time()
+
+                # LOOP: Predict until impact ground
+                while not rospy.is_shutdown():
+                    count += 1
+                    if count == 10:
+                        break
+                    if count > 1:
+                        self.printer.print_purple('\n' + name + 'predict ... ' + str(count))
                     # setup data
                     input_data = curr_historical_data[-self.input_len_req:]
                     # combine curr_historical_data and future prediction part of pred_seq
@@ -198,18 +227,26 @@ class NAEOnlinePredictor:
                     impact_point = self.pred_seq[-1]
                     # check impact point is in active range z
                     if impact_point[2] < self.active_range_z[0]:
-                        pred_impacted = True
-                        continue
-                    # publish prediction
-                    self.publish_prediction(self.pred_seq, impact_point=True, pred_traj=False)
-                    print('     ', name + 'published prediction with len: ', len(self.pred_seq))
+                        # publish prediction
+                        self.publish_prediction(self.pred_seq, impact_point=True, pred_traj=False)
+                        # print in green color
+                        self.printer.print_green(name + 'published prediction with len: ' + str(len(self.pred_seq)), enable=DEBUG_LOG)
+                        pred_rate = 1 / (time.time() - predict_time)
+                        if pred_rate <200:
+                            self.printer.print_purple('             predict rate: ' + str(pred_rate))
+                        else:
+                            self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
+                        break
 
     def publish_prediction(self, pred_seq, impact_point=True, pred_traj=True):
         if impact_point:
-            impact_point = Point()
-            impact_point.x = pred_seq[-1][0]
-            impact_point.y = pred_seq[-1][1]
-            impact_point.z = pred_seq[-1][2]
+            impact_point = PoseStamped()
+            impact_point.header.stamp = rospy.Time.now()
+            impact_point.header.frame_id = 'world'
+            impact_point.pose.position.x = pred_seq[-1][0]
+            impact_point.pose.position.y = pred_seq[-1][1]
+            impact_point.pose.position.z = pred_seq[-1][2]
+            impact_point.pose.orientation.w = 1
             self.impact_point_pub.publish(impact_point)
         if pred_traj:
             pred_traj = PointArray()
@@ -253,9 +290,12 @@ def main():
         'storage_max_len': 300
     }
 
-    active_range_x = rospy.get_param('~active_range_x', [0, 10000])
-    active_range_y = rospy.get_param('~active_range_y', [0, 10000])
-    active_range_z = rospy.get_param('~active_range_z', [0.2, 10000])
+    # active_range_x = rospy.get_param('~active_range_x', [2.5, 10000])
+    # active_range_y = rospy.get_param('~active_range_y', [0, 100000])
+    # active_range_z = rospy.get_param('~active_range_z', [0.2, 10000])
+    active_range_x = rospy.get_param('~active_range_x', [-0.5, 10000])
+    active_range_y = rospy.get_param('~active_range_y', [-1.5, 100000])
+    active_range_z = rospy.get_param('~active_range_z', [0.07, 10000])
     nae_online_predictor = NAEOnlinePredictor(model_path, model_params, training_params, prediction_params, mocap_topic, active_range_x, active_range_y, active_range_z, swap_y_z)
     rospy.spin()
 
