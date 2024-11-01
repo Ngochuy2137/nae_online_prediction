@@ -7,6 +7,7 @@ This is a ROS node that:
 import rospy
 import numpy as np
 from geometry_msgs.msg import Point, PoseStamped
+from std_msgs.msg import UInt8
 from nae_online_prediction.msg import PointArray
 from nae.nae import *
 from nae.utils.submodules.printer import Printer
@@ -14,6 +15,32 @@ import threading
 
 DEBUG_LOG = False
 
+class Range:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+    def is_in_range(self, val):
+        if val < self.start or val > self.end:
+            return False
+        return True
+    
+class RobotOperatingArea:
+    def __init__(self, x_range:Range, y_range:Range, z_range:Range, id):
+        self.x_range = x_range
+        self.y_range = y_range
+        self.z_range = z_range
+        self.id = id
+
+    def is_in_area(self, pos):
+        if not self.x_range.is_in_range(pos[0]) or not self.y_range.is_in_range(pos[1]) or not self.z_range.is_in_range(pos[2]):
+            return False
+        return True
+    def is_in_2d_area(self, pos):
+        if not self.x_range.is_in_range(pos[0]) or not self.y_range.is_in_range(pos[1]):
+            return False
+        return True
+    
 class HistoricalData:
     def __init__(self, storage_max_len=300):
         self.data_points = []
@@ -70,7 +97,7 @@ class HistoricalData:
         self.time_stamps = []
 
 class NAEOnlinePredictor:
-    def __init__(self, model_path, model_params, training_params, prediction_params, mocap_topic, active_range_x=[0, 10000], active_range_y=[0, 10000], active_range_z=[0.1, 10000], swap_y_z=False):
+    def __init__(self, model_path, model_params, training_params, prediction_params, mocap_topic, oprerating_areas, thow_active_range_x=[0, 10000], throw_active_range_y=[0, 10000], throw_active_range_z=[0.1, 10000], swap_y_z=False):
         # Load model
         self.nae = NAE(**model_params, **training_params, device=DEVICE)
         self.nae.load_model(model_path)
@@ -79,9 +106,10 @@ class NAEOnlinePredictor:
         self.input_len_req = training_params['input_len']
         self.future_pred_len = training_params['future_pred_len']
         self.auto_agressive_len = prediction_params['auto_agressive_len']
-        self.active_range_x = active_range_x
-        self.active_range_y = active_range_y
-        self.active_range_z = active_range_z
+        self.oprerating_areas = oprerating_areas
+        self.thow_active_range_x = thow_active_range_x
+        self.throw_active_range_y = throw_active_range_y
+        self.throw_active_range_z = throw_active_range_z
 
         self.swap_y_z = swap_y_z
         # Subscribe to mocap topic
@@ -89,6 +117,7 @@ class NAEOnlinePredictor:
         # Publish predicted trajectory
         self.predicted_traj_pub = rospy.Publisher('NAE/predicted_traj', PointArray, queue_size=1)
         self.impact_point_pub = rospy.Publisher('NAE/impact_point', PoseStamped, queue_size=1)
+        self.danger_zone_pub = rospy.Publisher('NAE/danger_zone', UInt8, queue_size=1)
 
         # Variables
         self.pred_seq = None
@@ -128,11 +157,11 @@ class NAEOnlinePredictor:
             return
         
         # check current position is in active range
-        if curr_pos[0] < self.active_range_x[0] or curr_pos[0] > self.active_range_x[1] or \
-            curr_pos[1] < self.active_range_y[0] or curr_pos[1] > self.active_range_y[1]:
+        if curr_pos[0] < self.thow_active_range_x[0] or curr_pos[0] > self.thow_active_range_x[1] or \
+            curr_pos[1] < self.throw_active_range_y[0] or curr_pos[1] > self.throw_active_range_y[1]:
 
             self.printer.print_purple(name + 'Current position is out of active range')
-            self.printer.print_purple('     cur_pos: ' + str(curr_pos) + ' active_range_x: ' + str(self.active_range_x) + ' active_range_y: ' + str(self.active_range_y))
+            self.printer.print_purple('     cur_pos: ' + str(curr_pos) + ' thow_active_range_x: ' + str(self.thow_active_range_x) + ' throw_active_range_y: ' + str(self.throw_active_range_y))
             return
     
         # TODO: Using queue to store data, prevent data loss
@@ -187,8 +216,8 @@ class NAEOnlinePredictor:
                 curr_pos = curr_historical_data[-1][:3]
 
                 # check out of active range x, y, z
-                if curr_pos[0] < self.active_range_x[0] or curr_pos[0] > self.active_range_x[1] or \
-                    curr_pos[1] < self.active_range_y[0] or curr_pos[1] > self.active_range_y[1]:
+                if curr_pos[0] < self.thow_active_range_x[0] or curr_pos[0] > self.thow_active_range_x[1] or \
+                    curr_pos[1] < self.throw_active_range_y[0] or curr_pos[1] > self.throw_active_range_y[1]:
                     rospy.logwarn(name + 'Current position is out of active range')
                     continue
 
@@ -199,8 +228,8 @@ class NAEOnlinePredictor:
                 # print('             get new data: ', len(curr_historical_data))
                 last_lenth = len(curr_historical_data)
 
-                if curr_pos[2] < self.active_range_z[0]:
-                    rospy.logwarn(name + 'Object height is under ' + str(self.active_range_z[0]) + ' m. Finish prediction !')
+                if curr_pos[2] < self.throw_active_range_z[0]:
+                    rospy.logwarn(name + 'Object height is under ' + str(self.throw_active_range_z[0]) + ' m. Finish prediction !')
                     # cleat enter event
                     self.pressed_enter_event.clear()
                     break
@@ -230,9 +259,13 @@ class NAEOnlinePredictor:
                     self.pred_seq = self.nae.predict(input_data, evaluation=True).cpu().numpy()[0]
                     final_pred_point = self.pred_seq[-1]
                     # check impact point is in active range z
-                    if final_pred_point[2] < self.active_range_z[0]:
+                    if final_pred_point[2] < self.throw_active_range_z[0]:
                         # publish prediction
-                        self.publish_prediction(self.pred_seq, impact_point=True, pred_traj=False)
+                        pred_impact_point = self.publish_prediction(self.pred_seq, impact_point=True, pred_traj=False)
+                        # get danger zone
+                        danger_zone = self.get_danger_zone(pred_impact_point)
+                        self.danger_zone_pub.publish(danger_zone)
+
                         # print in green color
                         self.printer.print_green(name + 'published prediction with len: ' + str(len(self.pred_seq)), enable=DEBUG_LOG)
                         pred_rate = 1 / (time.time() - predict_time)
@@ -242,25 +275,34 @@ class NAEOnlinePredictor:
                             self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
                         break
 
+    '''
+    Function publish_prediction:
+        function: 
+            + Publish predicted trajectory to a topic
+            + Filter and Publish predicted impact point to a topic
+        input:
+            + pred_seq: predicted trajectory
+            + impact_point: flag to publish impact point
+            + pred_traj: flag to publish predicted trajectory
+    '''
     def publish_prediction(self, pred_seq=None, impact_point=True, pred_traj=True):
+        impact_point = PoseStamped()
         if pred_seq is None:
-            impact_point = PoseStamped()
             impact_point.header.stamp = rospy.Time.now()
             impact_point.header.frame_id = 'world'
-            impact_point.pose.position.x = self.active_range_x[0]
-            impact_point.pose.position.y = self.active_range_y[0]
+            impact_point.pose.position.x = self.thow_active_range_x[0]
+            impact_point.pose.position.y = self.throw_active_range_y[0]
             impact_point.pose.position.z = 0
             impact_point.pose.orientation.w = 1
             self.impact_point_pub.publish(impact_point)
             self.printer.print_green('[PUBLISH-PREDICTION] Reset prediction to ' + str(impact_point.pose.position.x) + ' ' + str(impact_point.pose.position.y) + ' ' + str(impact_point.pose.position.z))
             return 
         if impact_point:
-            impact_point = PoseStamped()
             impact_point.header.stamp = rospy.Time.now()
             impact_point.header.frame_id = 'world'
 
-            # filter out impact point whose z close to self.active_range_z[0]
-            pred_seq_filtered = [pred_seq[i] for i in range(0, len(pred_seq)) if pred_seq[i][2] >= self.active_range_z[0]]
+            # filter out impact point whose z close to self.throw_active_range_z[0]
+            pred_seq_filtered = [pred_seq[i] for i in range(0, len(pred_seq)) if pred_seq[i][2] >= self.throw_active_range_z[0]]
             impact_point.pose.position.x = pred_seq_filtered[-1][0]
             impact_point.pose.position.y = pred_seq_filtered[-1][1]
             impact_point.pose.position.z = pred_seq_filtered[-1][2]
@@ -277,6 +319,15 @@ class NAEOnlinePredictor:
             points = [Point(x=pred_seq[i][0], y=pred_seq[i][1], z=pred_seq[i][2]) for i in range(0, len(pred_seq))]
             pred_traj.points = points
             self.predicted_traj_pub.publish(pred_traj)
+
+        return impact_point
+    
+    def get_danger_zone(self, pred_impact_point:PoseStamped):
+        # check which area the impact point is in
+        impact_point = [pred_impact_point.pose.position.x, pred_impact_point.pose.position.y, pred_impact_point.pose.position.z]
+        for area in self.oprerating_areas:
+            if area.is_in_2d_area(impact_point):
+                return area.id
 
 def main():
     rospy.init_node('nae_online_predictor')
@@ -314,13 +365,39 @@ def main():
         'storage_max_len': 300
     }
 
-    # active_range_x = rospy.get_param('~active_range_x', [2.5, 10000])
-    # active_range_y = rospy.get_param('~active_range_y', [0, 100000])
-    # active_range_z = rospy.get_param('~active_range_z', [0.2, 10000])
-    active_range_x = rospy.get_param('~active_range_x', [-0.5, 10000])
-    active_range_y = rospy.get_param('~active_range_y', [-1.5, 100000])
-    active_range_z = rospy.get_param('~active_range_z', [0.2, 10000])
-    nae_online_predictor = NAEOnlinePredictor(model_path, model_params, training_params, prediction_params, mocap_topic, active_range_x, active_range_y, active_range_z, swap_y_z)
+    # thow_active_range_x = rospy.get_param('~thow_active_range_x', [2.5, 10000])
+    # throw_active_range_y = rospy.get_param('~throw_active_range_y', [0, 100000])
+    # throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.2, 10000])
+    thow_active_range_x = rospy.get_param('~thow_active_range_x', [-0.5, 10000])
+    throw_active_range_y = rospy.get_param('~throw_active_range_y', [-1.5, 100000])
+    throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.2, 10000])
+
+    # setup robot operating area
+    area_1_x = Range(1, 2.5)
+    area_1_y = Range(-1.5, 0)
+    area_1_id = 1
+
+    area_2_x = Range(1, 2.5)
+    area_2_y = Range(0, 1.5)
+    area_2_id = 2
+
+    area_3_x = Range(2.5, 4)
+    area_3_y = Range(0, 1.5)
+    area_3_id = 3
+
+    area_4_x = Range(2.5, 4)
+    area_4_y = Range(-1.5, 0)
+    area_4_id = 4
+
+
+
+    area_1 = RobotOperatingArea(area_1_x, area_1_y, Range(0.2, 0.5), area_1_id)
+    area_2 = RobotOperatingArea(area_2_x, area_2_y, Range(0.2, 0.5), area_2_id)
+    area_3 = RobotOperatingArea(area_3_x, area_3_y, Range(0.2, 0.5), area_3_id)
+    area_4 = RobotOperatingArea(area_4_x, area_4_y, Range(0.2, 0.5), area_4_id)
+    oprerating_areas = [area_1, area_2, area_3, area_4]
+
+    nae_online_predictor = NAEOnlinePredictor(model_path, model_params, training_params, prediction_params, mocap_topic, oprerating_areas, thow_active_range_x, throw_active_range_y, throw_active_range_z, swap_y_z)
     rospy.spin()
 
 if __name__ == '__main__':
