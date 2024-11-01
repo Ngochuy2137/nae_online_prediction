@@ -121,6 +121,8 @@ class NAEOnlinePredictor:
 
         # Variables
         self.pred_seq = None
+        self.pred_impact_point = None
+        self.danger_zone_id = None
 
         # locks
         # self.enable_get_mocap_data_lock = threading.Lock()
@@ -160,8 +162,8 @@ class NAEOnlinePredictor:
         if curr_pos[0] < self.thow_active_range_x[0] or curr_pos[0] > self.thow_active_range_x[1] or \
             curr_pos[1] < self.throw_active_range_y[0] or curr_pos[1] > self.throw_active_range_y[1]:
 
-            self.printer.print_purple(name + 'Current position is out of active range')
-            self.printer.print_purple('     cur_pos: ' + str(curr_pos) + ' thow_active_range_x: ' + str(self.thow_active_range_x) + ' throw_active_range_y: ' + str(self.throw_active_range_y))
+            self.printer.print_purple(name + 'Current position is out of active range', enable=DEBUG_LOG)
+            self.printer.print_purple('     cur_pos: ' + str(curr_pos) + ' thow_active_range_x: ' + str(self.thow_active_range_x) + ' throw_active_range_y: ' + str(self.throw_active_range_y), enable=DEBUG_LOG)
             return
     
         # TODO: Using queue to store data, prevent data loss
@@ -180,6 +182,9 @@ class NAEOnlinePredictor:
         while not rospy.is_shutdown():
             name = '[ONLINE-PREDICT] '
 
+            # dummy predict to warm up
+            self.dummy_predict(iteration=3)
+
             # reset historical data
             self.historical_data_lock.acquire(blocking=True)
             self.historical_data.reset()
@@ -190,18 +195,20 @@ class NAEOnlinePredictor:
             print('\n\n')
             self.printer.print_green(name + '===============================', background=True)
             self.printer.print_green(name + 'Press ENTER 2 times to start predicting')
-            self.printer.print_green(name + '===============================\n', background=True)
+            self.printer.print_green(name + '===============================', background=True)
             input()
 
+            # reset variables
             last_lenth = 0
             self.pred_seq = None
-            self.publish_prediction(pred_seq=None)
+            self.pred_impact_point = None
+            self.danger_zone_id = None
+
+            self.publish_prediction(default_enable=True)
+            self.printer.print_green(name + 'Ready to predict. Press ENTER 1 more time', background=True)
             input()
 
             self.pressed_enter_event.set()
-            # check pressed enter event status
-            print('check pressed enter event status: ', self.pressed_enter_event.is_set())
-
             # LOOP: Prediction for one throw
             while not rospy.is_shutdown():
                 # get data
@@ -241,7 +248,16 @@ class NAEOnlinePredictor:
                 # LOOP: Predict until impact ground
                 while not rospy.is_shutdown():
                     count += 1
-                    if count == 10:
+                    if count == 5:
+                        print('\n-----')
+                        self.pred_impact_point = self.publish_prediction(impact_point_enable=True, pred_traj_enable=False, danger_zone_enable=True, print_title=name)
+                        # print in green color
+                        self.printer.print_green(name + 'published prediction with len: ' + str(len(self.pred_seq)), enable=DEBUG_LOG)
+                        pred_rate = 1 / (time.time() - predict_time)
+                        if pred_rate <200:
+                            self.printer.print_purple('             predict rate: ' + str(pred_rate))
+                        else:
+                            self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
                         break
                     if count > 1:
                         self.printer.print_purple('\n' + name + 'predict ... ' + str(count))
@@ -257,14 +273,17 @@ class NAEOnlinePredictor:
                     input_data = np.expand_dims(input_data, axis=0)
                     # predict
                     self.pred_seq = self.nae.predict(input_data, evaluation=True).cpu().numpy()[0]
+                    self.pred_impact_point = self.filter_impact_point(self.pred_seq)
+                    self.danger_zone_id = self.get_danger_zone(self.pred_impact_point)
+
+
                     final_pred_point = self.pred_seq[-1]
+                    
                     # check impact point is in active range z
                     if final_pred_point[2] < self.throw_active_range_z[0]:
                         # publish prediction
-                        pred_impact_point = self.publish_prediction(self.pred_seq, impact_point=True, pred_traj=False)
-                        # get danger zone
-                        danger_zone = self.get_danger_zone(pred_impact_point)
-                        self.danger_zone_pub.publish(danger_zone)
+                        print('\n-----')
+                        self.pred_impact_point = self.publish_prediction(impact_point_enable=True, pred_traj_enable=False, danger_zone_enable=True, print_title=name)
 
                         # print in green color
                         self.printer.print_green(name + 'published prediction with len: ' + str(len(self.pred_seq)), enable=DEBUG_LOG)
@@ -274,6 +293,25 @@ class NAEOnlinePredictor:
                         else:
                             self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
                         break
+
+    
+    '''
+    function: Filter impact point whose z close to self.throw_active_range_z[0]
+    '''
+    def filter_impact_point(self, pred_seq):
+        # filter out impact point whose z close to self.throw_active_range_z[0]
+        pred_seq_filtered = [pred_seq[i] for i in range(0, len(pred_seq)) if pred_seq[i][2] >= self.throw_active_range_z[0]]
+        impact_point = pred_seq_filtered[-1]
+        return impact_point
+    
+    '''
+    dummy predict for nae model to warm up
+    '''
+    def dummy_predict(self, iteration=1):
+        for i in range(iteration):
+            print('     dummy predict ... ', i)
+            input_data = np.random.rand(1, self.input_len_req, 9)
+            self.nae.predict(input_data, evaluation=True)
 
     '''
     Function publish_prediction:
@@ -285,9 +323,9 @@ class NAEOnlinePredictor:
             + impact_point: flag to publish impact point
             + pred_traj: flag to publish predicted trajectory
     '''
-    def publish_prediction(self, pred_seq=None, impact_point=True, pred_traj=True):
+    def publish_prediction(self, impact_point_enable=False, pred_traj_enable=False, danger_zone_enable=False, default_enable = False, print_title=''):
         impact_point = PoseStamped()
-        if pred_seq is None:
+        if default_enable:
             impact_point.header.stamp = rospy.Time.now()
             impact_point.header.frame_id = 'world'
             impact_point.pose.position.x = self.thow_active_range_x[0]
@@ -297,34 +335,33 @@ class NAEOnlinePredictor:
             self.impact_point_pub.publish(impact_point)
             self.printer.print_green('[PUBLISH-PREDICTION] Reset prediction to ' + str(impact_point.pose.position.x) + ' ' + str(impact_point.pose.position.y) + ' ' + str(impact_point.pose.position.z))
             return 
-        if impact_point:
+        
+        if impact_point_enable:
             impact_point.header.stamp = rospy.Time.now()
             impact_point.header.frame_id = 'world'
-
-            # filter out impact point whose z close to self.throw_active_range_z[0]
-            pred_seq_filtered = [pred_seq[i] for i in range(0, len(pred_seq)) if pred_seq[i][2] >= self.throw_active_range_z[0]]
-            impact_point.pose.position.x = pred_seq_filtered[-1][0]
-            impact_point.pose.position.y = pred_seq_filtered[-1][1]
-            impact_point.pose.position.z = pred_seq_filtered[-1][2]
+            impact_point.pose.position.x = self.pred_impact_point[0]
+            impact_point.pose.position.y = self.pred_impact_point[1]
+            impact_point.pose.position.z = self.pred_impact_point[2]
             impact_point.pose.orientation.w = 1
-
-            print('\nPredicted impact point:')
-
-            for p in pred_seq_filtered[-10:]:
-                print('     point: ', round(p[0], 5), ' ', round(p[1], 5), ' ', round(p[2], 5))
-
             self.impact_point_pub.publish(impact_point)
-        if pred_traj:
+            self.printer.print_green(print_title + 'pred_impact_point: ' + str(self.pred_impact_point[0]) + ' ' + str(self.pred_impact_point[1]) + ' ' + str(self.pred_impact_point[2]))
+
+
+        if pred_traj_enable:
             pred_traj = PointArray()
-            points = [Point(x=pred_seq[i][0], y=pred_seq[i][1], z=pred_seq[i][2]) for i in range(0, len(pred_seq))]
+            points = [Point(x=self.pred_seq[i][0], y=self.pred_seq[i][1], z=self.pred_seq[i][2]) for i in range(0, len(self.pred_seq))]
             pred_traj.points = points
             self.predicted_traj_pub.publish(pred_traj)
 
-        return impact_point
+        if danger_zone_enable:
+            self.danger_zone_pub.publish(self.danger_zone_id)
+            self.printer.print_green(print_title + 'danger_zone:       ' + str(self.danger_zone_id))
+
+        return
     
-    def get_danger_zone(self, pred_impact_point:PoseStamped):
+    def get_danger_zone(self, pred_impact_point):
         # check which area the impact point is in
-        impact_point = [pred_impact_point.pose.position.x, pred_impact_point.pose.position.y, pred_impact_point.pose.position.z]
+        impact_point = [pred_impact_point[0], pred_impact_point[1], pred_impact_point[2]]
         for area in self.oprerating_areas:
             if area.is_in_2d_area(impact_point):
                 return area.id
@@ -370,7 +407,7 @@ def main():
     # throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.2, 10000])
     thow_active_range_x = rospy.get_param('~thow_active_range_x', [-0.5, 10000])
     throw_active_range_y = rospy.get_param('~throw_active_range_y', [-1.5, 100000])
-    throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.2, 10000])
+    throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.3, 10000])
 
     # setup robot operating area
     area_1_x = Range(1, 2.5)
