@@ -8,7 +8,7 @@ import rospy
 import numpy as np
 from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import UInt8
-from nae_online_prediction.msg import PointArray
+from nav_msgs.msg import Path
 from nae.nae import *
 from nae.utils.submodules.printer import Printer
 import threading
@@ -115,7 +115,7 @@ class NAEOnlinePredictor:
         # Subscribe to mocap topic
         self.mocap_sub = rospy.Subscriber(mocap_topic, PoseStamped, self.mocap_callback)
         # Publish predicted trajectory
-        self.predicted_traj_pub = rospy.Publisher('NAE/predicted_traj', PointArray, queue_size=1)
+        self.predicted_traj_pub = rospy.Publisher('NAE/predicted_traj', Path, queue_size=1)
         self.impact_point_pub = rospy.Publisher('NAE/impact_point', PoseStamped, queue_size=1)
         self.danger_zone_pub = rospy.Publisher('NAE/danger_zone', UInt8, queue_size=1)
 
@@ -228,9 +228,9 @@ class NAEOnlinePredictor:
                     rospy.logwarn(name + 'Current position is out of active range')
                     continue
 
-                if len(curr_historical_data) == last_lenth:
-                    # print('     ', name + 'No new data, skip this loop, current length: ', last_lenth)
-                    continue
+                # if len(curr_historical_data) == last_lenth:
+                #     print('     ', name + 'No new data, skip this loop, current length: ', last_lenth)
+                #     continue
 
                 # print('             get new data: ', len(curr_historical_data))
                 last_lenth = len(curr_historical_data)
@@ -248,9 +248,11 @@ class NAEOnlinePredictor:
                 # LOOP: Predict until impact ground
                 while not rospy.is_shutdown():
                     count += 1
+                    if count > 1:
+                        self.printer.print_purple('\n' + name + 'predict ... ' + str(count))
                     if count == 5:
-                        print('\n-----')
-                        self.pred_impact_point = self.publish_prediction(impact_point_enable=True, pred_traj_enable=False, danger_zone_enable=True, print_title=name)
+                        print('\n----- 222')
+                        self.pred_impact_point = self.publish_prediction(impact_point_enable=True, pred_traj_enable=True, danger_zone_enable=True, print_title=name)
                         # print in green color
                         self.printer.print_green(name + 'published prediction with len: ' + str(len(self.pred_seq)), enable=DEBUG_LOG)
                         pred_rate = 1 / (time.time() - predict_time)
@@ -259,8 +261,7 @@ class NAEOnlinePredictor:
                         else:
                             self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
                         break
-                    if count > 1:
-                        self.printer.print_purple('\n' + name + 'predict ... ' + str(count))
+
                     # setup data
                     input_data = curr_historical_data[-self.input_len_req:]
                     # combine curr_historical_data and future prediction part of pred_seq
@@ -273,36 +274,42 @@ class NAEOnlinePredictor:
                     input_data = np.expand_dims(input_data, axis=0)
                     # predict
                     self.pred_seq = self.nae.predict(input_data, evaluation=True).cpu().numpy()[0]
-                    self.pred_impact_point = self.filter_impact_point(self.pred_seq)
+
+                    is_impact_prediction, self.pred_seq = self.filter_impact_point(self.pred_seq)
+                    self.pred_impact_point = self.pred_seq[-1]
                     self.danger_zone_id = self.get_danger_zone(self.pred_impact_point)
 
-
-                    final_pred_point = self.pred_seq[-1]
-                    
-                    # check impact point is in active range z
-                    if final_pred_point[2] < self.throw_active_range_z[0]:
+                    if is_impact_prediction:
                         # publish prediction
-                        print('\n-----')
-                        self.pred_impact_point = self.publish_prediction(impact_point_enable=True, pred_traj_enable=False, danger_zone_enable=True, print_title=name)
+                        print('\n----- 111')
+                        self.publish_prediction(impact_point_enable=True, pred_traj_enable=True, danger_zone_enable=True, print_title=name)
 
-                        # print in green color
+                        # log
                         self.printer.print_green(name + 'published prediction with len: ' + str(len(self.pred_seq)), enable=DEBUG_LOG)
                         pred_rate = 1 / (time.time() - predict_time)
                         if pred_rate <200:
                             self.printer.print_purple('             predict rate: ' + str(pred_rate))
                         else:
                             self.printer.print_green('             predict rate: ' + str(pred_rate), enable=DEBUG_LOG)
+                        
                         break
 
     
     '''
-    function: Filter impact point whose z close to self.throw_active_range_z[0]
+    function: Filter impact point whose z close to self.throw_active_range_z[0], shorten the predicted trajectory
+    return:
+        + is_impact_prediction: flag to check if the predicted seq pass the height limit with z = self.throw_active_range_z[0]
+        + pred_seq: the pred_seq might be shorten
     '''
     def filter_impact_point(self, pred_seq):
         # filter out impact point whose z close to self.throw_active_range_z[0]
-        pred_seq_filtered = [pred_seq[i] for i in range(0, len(pred_seq)) if pred_seq[i][2] >= self.throw_active_range_z[0]]
-        impact_point = pred_seq_filtered[-1]
-        return impact_point
+        is_impact_prediction = False
+        for i in range(len(pred_seq)):
+            if pred_seq[i][2] <= self.throw_active_range_z[0]:
+                pred_seq = pred_seq[:i+1]
+                is_impact_prediction = True
+                break
+        return is_impact_prediction, pred_seq
     
     '''
     dummy predict for nae model to warm up
@@ -348,9 +355,23 @@ class NAEOnlinePredictor:
 
 
         if pred_traj_enable:
-            pred_traj = PointArray()
-            points = [Point(x=self.pred_seq[i][0], y=self.pred_seq[i][1], z=self.pred_seq[i][2]) for i in range(0, len(self.pred_seq))]
-            pred_traj.points = points
+            pred_traj = Path()
+            pred_traj.header.stamp = rospy.Time.now()
+            pred_traj.header.frame_id = 'world'
+            # setup points
+            for i in range(0, len(self.pred_seq)):
+                point = Point()
+                point.x = self.pred_seq[i][0]
+                point.y = self.pred_seq[i][1]
+                point.z = self.pred_seq[i][2]
+
+                one_data_pose_stamp = PoseStamped()
+                one_data_pose_stamp.pose.position = point
+                one_data_pose_stamp.pose.orientation.w = 1
+                one_data_pose_stamp.header = pred_traj.header
+                one_data_pose_stamp.header.seq = i
+                pred_traj.poses.append(one_data_pose_stamp)
+
             self.predicted_traj_pub.publish(pred_traj)
 
         if danger_zone_enable:
