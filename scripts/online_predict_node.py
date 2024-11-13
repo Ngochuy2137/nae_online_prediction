@@ -400,7 +400,7 @@ def main():
 
 
     # Learning parameters
-    input_lenth = 10
+    input_lenth = 15
     future_pred_len = 50
     thrown_object = 'frisbee'
     training_params = {
@@ -427,8 +427,8 @@ def main():
     # thow_active_range_x = rospy.get_param('~thow_active_range_x', [2.5, 10000])
     # throw_active_range_y = rospy.get_param('~throw_active_range_y', [0, 100000])
     # throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.2, 10000])
-    thow_active_range_x = rospy.get_param('~thow_active_range_x', [-0.5, 10000])
-    throw_active_range_y = rospy.get_param('~throw_active_range_y', [-1.5, 100000])
+    thow_active_range_x = rospy.get_param('~thow_active_range_x', [-1.0, 10000])
+    throw_active_range_y = rospy.get_param('~throw_active_range_y', [-2.5, 100000])
     throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.3, 10000])
 
     # setup robot operating area
