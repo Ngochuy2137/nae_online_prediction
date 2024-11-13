@@ -182,9 +182,6 @@ class NAEOnlinePredictor:
         while not rospy.is_shutdown():
             name = '[ONLINE-PREDICT] '
 
-            # dummy predict to warm up
-            self.dummy_predict(iteration=3)
-
             # reset historical data
             self.historical_data_lock.acquire(blocking=True)
             self.historical_data.reset()
@@ -210,7 +207,12 @@ class NAEOnlinePredictor:
 
             self.pressed_enter_event.set()
             # LOOP: Prediction for one throw
+            count = 0
             while not rospy.is_shutdown():
+                if count == 0:
+                    # dummy predict to warm up
+                    self.dummy_predict(iteration=3)
+                    count += 1
                 # get data
                 self.historical_data_lock.acquire(blocking=True)
                 curr_historical_data = self.historical_data.get_data()
@@ -315,10 +317,9 @@ class NAEOnlinePredictor:
     dummy predict for nae model to warm up
     '''
     def dummy_predict(self, iteration=1):
-        for i in range(iteration):
-            print('     dummy predict ... ', i)
-            input_data = np.random.rand(1, self.input_len_req, 9)
-            self.nae.predict(input_data, evaluation=True)
+        print('     dummy predict ... ')
+        input_data = np.random.rand(iteration, self.input_len_req, 9)
+        self.nae.predict(input_data, evaluation=True)
 
     '''
     Function publish_prediction:
@@ -431,20 +432,20 @@ def main():
     throw_active_range_z = rospy.get_param('~throw_active_range_z', [0.3, 10000])
 
     # setup robot operating area
-    area_1_x = Range(1, 2.5)
-    area_1_y = Range(-1.5, 0)
+    area_1_x = Range(1.5, 3.0) 
+    area_1_y = Range(-3.2, 0)
     area_1_id = 1
 
-    area_2_x = Range(1, 2.5)
-    area_2_y = Range(0, 1.5)
+    area_2_x = Range(1.5, 3.0)
+    area_2_y = Range(0, 3.2)
     area_2_id = 2
 
-    area_3_x = Range(2.5, 4)
-    area_3_y = Range(0, 1.5)
+    area_3_x = Range(3, 4.5)
+    area_3_y = Range(0, 3.2)
     area_3_id = 3
 
-    area_4_x = Range(2.5, 4)
-    area_4_y = Range(-1.5, 0)
+    area_4_x = Range(3, 4.5)
+    area_4_y = Range(-3.2, 0)
     area_4_id = 4
 
 
